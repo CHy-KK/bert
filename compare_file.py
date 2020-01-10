@@ -121,47 +121,57 @@ flags.DEFINE_integer(
 
 flags.DEFINE_string("middle_output", "middle_data", "Dir was used to store middle data!")
 flags.DEFINE_string("crf", "True", "use crf!")
+flags.DEFINE_integer("doc_stride", 128, "doc_stride default 128")
 
 class InputExample(object):
-  """A single training/test example for simple sequence classification."""
+    """A single training/test example for simple sequence classification."""
 
-  def __init__(self, guid, text, label=None):
-    """Constructs a InputExample.
-    Args:
-      guid: Unique id for the example.
-      text_a: string. The untokenized text of the first sequence. For single
-        sequence tasks, only this sequence must be specified.
-      label: (Optional) string. The label of the example. This should be
-        specified for train and dev examples, but not for test examples.
-    """
-    self.guid = guid
-    self.text = text
-    self.label = label
+    def __init__(self, guid, text, label=None):
+        """Constructs a InputExample.
+
+        Args:
+          guid: Unique id for the example.
+          text_a: string. The untokenized text of the first sequence. For single
+            sequence tasks, only this sequence must be specified.
+          label: (Optional) string. The label of the example. This should be
+            specified for train and dev examples, but not for test examples.
+        """
+        self.guid = guid
+        self.text = text
+        self.label = label
 
 class PaddingInputExample(object):
-  """Fake example so the num input examples is a multiple of the batch size.
-  When running eval/predict on the TPU, we need to pad the number of examples
-  to be a multiple of the batch size, because the TPU requires a fixed batch
-  size. The alternative is to drop the last batch, which is bad because it means
-  the entire output data won't be generated.
-  We use this class instead of `None` because treating `None` as padding
-  battches could cause silent errors.
-  """
+    """Fake example so the num input examples is a multiple of the batch size.
+
+    When running eval/predict on the TPU, we need to pad the number of examples
+    to be a multiple of the batch size, because the TPU requires a fixed batch
+    size. The alternative is to drop the last batch, which is bad because it means
+    the entire output data won't be generated.
+
+    We use this class instead of `None` because treating `None` as padding
+    battches could cause silent errors.
+    """
 
 class InputFeatures(object):
-  """A single set of features of data."""
+    """A single set of features of data."""
 
-  def __init__(self,
-               input_ids,
-               mask,
-               segment_ids,
-               label_ids,
-               is_real_example=True):
-    self.input_ids = input_ids
-    self.mask = mask
-    self.segment_ids = segment_ids
-    self.label_ids = label_ids
-    self.is_real_example = is_real_example
+    def __init__(self,
+                 input_ids,
+                 mask,
+                 segment_ids,
+                 label_ids,
+                 token_is_max_context,
+                 doc_span_index,
+                 example_index,
+                 is_real_example=True):
+        self.input_ids = input_ids
+        self.mask = mask
+        self.segment_ids = segment_ids
+        self.label_ids = label_ids
+        self.token_is_max_context = token_is_max_context
+        self.doc_span_index = doc_span_index
+        self.example_index = example_index
+        self.is_real_example = is_real_example
 
 class DataProcessor(object):
     """Base class for data converters for sequence classification data sets."""
@@ -236,7 +246,43 @@ class NerProcessor(DataProcessor):
         return examples
 
 
-def convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, mode):
+def _check_is_max_context(doc_spans, cur_span_index, position):
+    """Check if this is the 'max context' doc span for the token."""
+
+    # Because of the sliding window approach taken to scoring documents, a single
+    # token can appear in multiple documents. E.g.
+    #  Doc: the man went to the store and bought a gallon of milk
+    #  Span A: the man went to the
+    #  Span B: to the store and bought
+    #  Span C: and bought a gallon of
+    #  ...
+    #
+    # Now the word 'bought' will have two scores from spans B and C. We only
+    # want to consider the score with "maximum context", which we define as
+    # the *minimum* of its left and right context (the *sum* of left and
+    # right context will always be the same, of course).
+    #
+    # In the example the maximum context for 'bought' would be span C since
+    # it has 1 left context and 3 right context, while span B has 4 left context
+    # and 0 right context.
+    best_score = None
+    best_span_index = None
+    for (span_index, doc_span) in enumerate(doc_spans):
+        end = doc_span.start + doc_span.length - 1
+        if position < doc_span.start:
+            continue
+        if position > end:
+            continue
+        num_left_context = position - doc_span.start
+        num_right_context = end - position
+        score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
+        if best_score is None or score > best_score:
+            best_score = score
+            best_span_index = span_index
+
+    return cur_span_index == best_span_index
+
+def convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, doc_stride ,mode):
     """
     :param ex_index: example num
     :param example:
@@ -245,9 +291,11 @@ def convert_single_example(ex_index, example, label_list, max_seq_length, tokeni
     :param tokenizer: WordPiece tokenization
     :param mode:
     :return: feature
+
     IN this part we should rebuild input sentences to the following format.
     example:[Jim,Hen,##son,was,a,puppet,##eer]
     labels: [I-PER,I-PER,X,O,O,O,X]
+
     """
     label_map = {}
     #here start with zero this means that "[PAD]" is zero
@@ -267,79 +315,114 @@ def convert_single_example(ex_index, example, label_list, max_seq_length, tokeni
                 labels.append(label)
             else:
                 labels.append("X")
-    # only Account for [CLS] with "- 1".
-    if len(tokens) >= max_seq_length - 1:
-        tokens = tokens[0:(max_seq_length - 1)]
-        labels = labels[0:(max_seq_length - 1)]
-    ntokens = []
-    segment_ids = []
-    label_ids = []
-    ntokens.append("[CLS]")
-    segment_ids.append(0)
-    label_ids.append(label_map["[CLS]"])
-    for i, token in enumerate(tokens):
-        ntokens.append(token)
+    # print(">>>>>>>>>>>>>>>>", len(tokens))
+    max_tokens_for_doc = max_seq_length - 1
+    _DocSpan = collections.namedtuple(  # pylint: disable=invalid-name
+        "DocSpan", ["start", "length"])
+    doc_spans = []
+    start_offset = 0
+    while start_offset < len(tokens):
+        length = len(tokens) - start_offset
+        if length > max_tokens_for_doc:
+            length = max_tokens_for_doc
+        doc_spans.append(_DocSpan(start=start_offset, length=length))
+        if start_offset + length == len(tokens):
+            break
+        start_offset += min(length, doc_stride)
+
+    feature_list, ntokens_list, label_ids_list = [], [], []
+    for (doc_span_index, doc_span) in enumerate(doc_spans):
+        # token_to_orig_map = {}
+        token_is_max_context = {}
+        ntokens = []
+        label_ids = []
+        segment_ids = []
+        ntokens.append("[CLS]")
+        label_ids.append(label_map["[CLS]"])
         segment_ids.append(0)
-        label_ids.append(label_map[labels[i]])
-    # after that we don't add "[SEP]" because we want a sentence don't have
-    # stop tag, because i think its not very necessary.
-    # or if add "[SEP]" the model even will cause problem, special the crf layer was used.
-    input_ids = tokenizer.convert_tokens_to_ids(ntokens)
-    mask = [1]*len(input_ids)
-    #use zero to padding and you should
-    while len(input_ids) < max_seq_length:
-        input_ids.append(0)
-        mask.append(0)
-        segment_ids.append(0)
-        label_ids.append(0)
-        ntokens.append("[PAD]")
-    assert len(input_ids) == max_seq_length
-    assert len(mask) == max_seq_length
-    assert len(segment_ids) == max_seq_length
-    assert len(label_ids) == max_seq_length
-    assert len(ntokens) == max_seq_length
+        for i in range(doc_span.length):
+            split_token_index = doc_span.start + i
+            # token_to_orig_map[len(ntokens)] = tok_to_orig_index[split_token_index]
+
+            is_max_context = _check_is_max_context(doc_spans, doc_span_index,
+                                                   split_token_index)
+            token_is_max_context[split_token_index] = is_max_context
+            ntokens.append(tokens[split_token_index])
+            label_ids.append(label_map[labels[split_token_index]])
+            segment_ids.append(0)
+
+        input_ids = tokenizer.convert_tokens_to_ids(ntokens)
+        mask = [1] * len(input_ids)
+
+        while len(input_ids) < max_seq_length:
+            input_ids.append(0)
+            mask.append(0)
+            segment_ids.append(0)
+            label_ids.append(0)
+            ntokens.append("[PAD]")
+        # print(len(input_ids))
+        assert len(input_ids) == max_seq_length
+        assert len(mask) == max_seq_length
+        assert len(segment_ids) == max_seq_length
+        assert len(label_ids) == max_seq_length
+        assert len(ntokens) == max_seq_length
+
+        feature = InputFeatures(
+            input_ids=input_ids,
+            mask=mask,
+            segment_ids=segment_ids,
+            label_ids=label_ids,
+            token_is_max_context=token_is_max_context,
+            doc_span_index=doc_span_index,
+            example_index=ex_index
+        )
+        feature_list.append(feature)
+        ntokens_list.append(ntokens)
+        label_ids_list.append(label_ids)
+
     if ex_index < 3:
         logging.info("*** Example ***")
         logging.info("guid: %s" % (example.guid))
-        logging.info("tokens: %s" % " ".join(
-            [tokenization.printable_text(x) for x in tokens]))
+        # print(tokens)
+        logging.info("tokens: %s" % " ".join([tokenization.printable_text(x) for x in tokens]))
         logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
         logging.info("input_mask: %s" % " ".join([str(x) for x in mask]))
         logging.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
         logging.info("label_ids: %s" % " ".join([str(x) for x in label_ids]))
-    feature = InputFeatures(
-        input_ids=input_ids,
-        mask=mask,
-        segment_ids=segment_ids,
-        label_ids=label_ids,
-    )
-    # we need ntokens because if we do predict it can help us return to original token.
-    return feature,ntokens,label_ids
 
-def filed_based_convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, output_file,mode=None):
+    return feature_list,ntokens_list,label_ids_list
+
+def filed_based_convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, output_file,doc_stride,mode=None):
     writer = tf.python_io.TFRecordWriter(output_file)
     batch_tokens = []
     batch_labels = []
+    batch_index = []
+    feature_list_total = []
+    # print(len(examples))
     for (ex_index, example) in enumerate(examples):
         if ex_index % 5000 == 0:
             logging.info("Writing example %d of %d" % (ex_index, len(examples)))
-        feature,ntokens,label_ids = convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, mode)
-        batch_tokens.extend(ntokens)
-        batch_labels.extend(label_ids)
-        def create_int_feature(values):
-            f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
-            return f
+        feature_list,ntokens_list,label_ids_list = convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, doc_stride , mode)
+        feature_list_total.extend(feature_list)
+        for feature, ntokens, label_ids in zip(feature_list,ntokens_list,label_ids_list):
+            batch_tokens.extend(ntokens)
+            batch_labels.extend(label_ids)
+            batch_index.extend([ex_index]*len(ntokens))
+            def create_int_feature(values):
+                f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
+                return f
 
-        features = collections.OrderedDict()
-        features["input_ids"] = create_int_feature(feature.input_ids)
-        features["mask"] = create_int_feature(feature.mask)
-        features["segment_ids"] = create_int_feature(feature.segment_ids)
-        features["label_ids"] = create_int_feature(feature.label_ids)
-        tf_example = tf.train.Example(features=tf.train.Features(feature=features))
-        writer.write(tf_example.SerializeToString())
+            features = collections.OrderedDict()
+            features["input_ids"] = create_int_feature(feature.input_ids)
+            features["mask"] = create_int_feature(feature.mask)
+            features["segment_ids"] = create_int_feature(feature.segment_ids)
+            features["label_ids"] = create_int_feature(feature.label_ids)
+
+            tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+            writer.write(tf_example.SerializeToString())
     # sentence token in each batch
     writer.close()
-    return batch_tokens,batch_labels
+    return batch_tokens,batch_labels,batch_index,feature_list_total
 
 def file_based_input_fn_builder(input_file, seq_length, is_training, drop_remainder):
     name_to_features = {
@@ -389,14 +472,14 @@ def crf_loss(logits,labels,mask,num_labels,mask2len):
     #TODO
     with tf.variable_scope("crf_loss"):
         trans = tf.get_variable(
-                "transition",
-                shape=[num_labels,num_labels],
-                initializer=tf.contrib.layers.xavier_initializer()
+            "transition",
+            shape=[num_labels,num_labels],
+            initializer=tf.contrib.layers.xavier_initializer()
         )
-    
+
     log_likelihood,transition = tf.contrib.crf.crf_log_likelihood(logits,labels,transition_params =trans ,sequence_lengths=mask2len)
     loss = tf.math.reduce_mean(-log_likelihood)
-   
+
     return loss,transition
 
 def softmax_layer(logits,labels,num_labels,mask):
@@ -425,7 +508,7 @@ def create_model(bert_config, is_training, input_ids, mask,
         input_mask=mask,
         token_type_ids=segment_ids,
         use_one_hot_embeddings=use_one_hot_embeddings
-        )
+    )
 
     output_layer = model.get_sequence_output()
     #output_layer shape is
@@ -459,13 +542,13 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
         if FLAGS.crf:
             (total_loss, logits,predicts) = create_model(bert_config, is_training, input_ids,
-                                                            mask, segment_ids, label_ids,num_labels, 
-                                                            use_one_hot_embeddings)
+                                                         mask, segment_ids, label_ids,num_labels,
+                                                         use_one_hot_embeddings)
 
         else:
             (total_loss, logits, predicts) = create_model(bert_config, is_training, input_ids,
-                                                            mask, segment_ids, label_ids,num_labels, 
-                                                            use_one_hot_embeddings)
+                                                          mask, segment_ids, label_ids,num_labels,
+                                                          use_one_hot_embeddings)
         tvars = tf.trainable_variables()
         scaffold_fn = None
         initialized_variable_names=None
@@ -486,9 +569,9 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
             if var.name in initialized_variable_names:
                 init_string = ", *INIT_FROM_CKPT*"
             logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                            init_string)
+                         init_string)
 
-        
+
 
         if mode == tf.estimator.ModeKeys.TRAIN:
             train_op = optimization.create_optimizer(total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
@@ -532,37 +615,96 @@ def _write_base(batch_tokens,id2label,prediction,batch_labels,wf,i):
         line = "{}\t{}\t{}\n".format(token,true_l,predict)
         wf.write(line)
 
-def Writer(output_predict_file,result,batch_tokens,batch_labels,id2label):
-    # pdb.set_trace()
+def Writer(output_predict_file,result,batch_tokens,batch_labels,batch_indexes,id2label,all_features,max_seq_length,doc_stride):
+    # max_seq_length = 512
+    # doc_stride = 128
+    example_index_to_features = collections.defaultdict(list)
+    for feature in all_features:
+        example_index_to_features[feature.example_index].append(feature)
+
+
     with open(output_predict_file,'w') as wf:
 
         if  FLAGS.crf:
             predictions  = []
+            # current_features = None
             for m,pred in enumerate(result):
                 predictions.extend(pred)
+                # current_features = all_features[m]
 
             batch_labels_copy = []
             batch_tokens_copy = []
             predictions_copy = []
-            pred_copy = []
+            batch_indexes_copy = []
+
+            # remove [CLS]
+            for i, prediction in enumerate(predictions):
+                if prediction!=40:
+                    predictions_copy.append(prediction)
+                    batch_labels_copy.append(batch_labels[i])
+                    batch_tokens_copy.append(batch_tokens[i])
+                    batch_indexes_copy.append(batch_indexes[i])
+
+            batch_labels_copy_1 = []
+            batch_tokens_copy_1 = []
+            predictions_copy_1 = []
+            batch_indexes_copy_1 = []
+
+            # to concatenate various doc_spans of a single example in one
+            e_index = 0
+            for i, prediction in enumerate(predictions_copy):
+                ex_index = batch_indexes_copy[i]
+                if i>0 and batch_indexes_copy[i] != batch_indexes_copy[i-1]:
+                    e_index = 0
+
+                current_features = example_index_to_features[ex_index]
+                for feature in current_features:
+                    if not feature.token_is_max_context.get(e_index, False):
+                        # e_index += 1
+                        continue
+                    else:
+                        batch_labels_copy_1.append(batch_labels_copy[feature.doc_span_index*(max_seq_length-1) + (e_index-(feature.doc_span_index*doc_stride))])
+                        batch_tokens_copy_1.append(batch_tokens_copy[feature.doc_span_index*(max_seq_length-1) + (e_index-(feature.doc_span_index*doc_stride))])
+                        predictions_copy_1.append(predictions_copy[feature.doc_span_index*(max_seq_length-1) + (e_index-(feature.doc_span_index*doc_stride))])
+                        batch_indexes_copy_1.append(batch_indexes_copy[feature.doc_span_index*(max_seq_length-1) + (e_index-(feature.doc_span_index*doc_stride))])
+                        e_index += 1
+                        break
+
+            batch_labels_copy_2 = []
+            batch_tokens_copy_2 = []
+            predictions_copy_2 = []
+            batch_indexes_copy_2 = []
+
+            # to concatenate tokens with '##' (reverse tokenization)
             j = 0
-            for i, (il,it) in enumerate(zip(batch_labels, batch_tokens)):
-                if il!=39:
-                    batch_labels_copy.append(il)
-                    batch_tokens_copy.append(it)
-                    predictions_copy.append(predictions[i])
+            for i, (il,it) in enumerate(zip(batch_labels_copy_1, batch_tokens_copy_1)):
+                if i==0 or (il!=39 and it!='[CLS]'):
+                    batch_labels_copy_2.append(il)
+                    batch_tokens_copy_2.append(it)
+                    predictions_copy_2.append(predictions_copy_1[i])
+                    batch_indexes_copy_2.append(batch_indexes_copy_1[i])
                     j+=1
                 else:
+                    if it == '[CLS]':
+                        continue
                     if it.startswith('##'):
                         it = it[2:]
-                    batch_tokens_copy[j-1]+=it
-            for i,prediction in enumerate(predictions_copy):
-                _write_base(batch_tokens_copy,id2label,prediction,batch_labels_copy,wf,i)
-                
+                    batch_tokens_copy_2[j-1]+=it
+            
+            
+
+            # write examples to file
+            for i,prediction in enumerate(predictions_copy_2):
+                if i>0 and batch_indexes_copy_2[i] != batch_indexes_copy_2[i-1]:
+                    wf.write('\n')
+                    _write_base(batch_tokens_copy_2, id2label, prediction, batch_labels_copy_2, wf, i)
+                else:
+                    _write_base(batch_tokens_copy_2,id2label,prediction,batch_labels_copy_2,wf,i)
+
         else:
             for i,prediction in enumerate(result):
                 _write_base(batch_tokens,id2label,prediction,batch_labels,wf,i)
-            
+
 
 
 def main(_):
@@ -629,8 +771,8 @@ def main(_):
 
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
-        _,_ = filed_based_convert_examples_to_features(
-            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
+        _,_,_,_ = filed_based_convert_examples_to_features(
+            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, FLAGS.doc_stride)
         logging.info("***** Running training *****")
         logging.info("  Num examples = %d", len(train_examples))
         logging.info("  Batch size = %d", FLAGS.train_batch_size)
@@ -644,8 +786,8 @@ def main(_):
     if FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
         eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
-        batch_tokens,batch_labels = filed_based_convert_examples_to_features(
-            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
+        _,_,_,_ = filed_based_convert_examples_to_features(
+            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, FLAGS.doc_stride)
 
         logging.info("***** Running evaluation *****")
         logging.info("  Num examples = %d", len(eval_examples))
@@ -672,17 +814,17 @@ def main(_):
 
 
     if FLAGS.do_predict:
-     
+
         with open(FLAGS.middle_output+'/label2id.pkl', 'rb') as rf:
             label2id = pickle.load(rf)
             id2label = {value: key for key, value in label2id.items()}
-   
+
         predict_examples = processor.get_test_examples(FLAGS.data_dir)
 
         predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
-        batch_tokens,batch_labels = filed_based_convert_examples_to_features(predict_examples, label_list,
-                                                 FLAGS.max_seq_length, tokenizer,
-                                                 predict_file)
+        batch_tokens,batch_labels,batch_indexes,all_features = filed_based_convert_examples_to_features(predict_examples, label_list,
+                                                                             FLAGS.max_seq_length, tokenizer,
+                                                                             predict_file, FLAGS.doc_stride)
 
         logging.info("***** Running prediction*****")
         logging.info("  Num examples = %d", len(predict_examples))
@@ -698,7 +840,7 @@ def main(_):
         output_predict_file = os.path.join(FLAGS.output_dir, "label_test.txt")
         #here if the tag is "X" means it belong to its before token, here for convenient evaluate use
         # conlleval.pl we  discarding it directly
-        Writer(output_predict_file,result,batch_tokens,batch_labels,id2label)
+        Writer(output_predict_file,result,batch_tokens,batch_labels,batch_indexes,id2label,all_features,FLAGS.max_seq_length,FLAGS.doc_stride)
 
 
 if __name__ == "__main__":
