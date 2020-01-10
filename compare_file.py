@@ -27,5 +27,6 @@ def filed_based_convert_examples_to_features(examples, label_list, max_seq_lengt
             tf_example = tf.train.Example(features=tf.train.Features(feature=features))
             writer.write(tf_example.SerializeToString())
     # sentence token in each batch
+
     writer.close()
     return batch_tokens,batch_labels,batch_index,feature_list_total
